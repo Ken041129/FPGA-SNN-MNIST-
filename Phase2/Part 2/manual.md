@@ -1,0 +1,1 @@
+cur = W @ input
