@@ -1,0 +1,11 @@
+// Test weights: 2 neurons x 4 inputs
+// neuron 0
+0A
+14
+FB
+0F
+// neuron 1
+05
+05
+05
+05
