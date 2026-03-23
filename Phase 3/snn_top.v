@@ -1,0 +1,309 @@
+// =============================================================
+// snn_top.v — SNN 推論引擎 Top Module
+// =============================================================
+//
+// 完整的兩層 SNN 推論：
+//   1. 外部把 784 個像素寫入 input BRAM
+//   2. start=1 啟動推論
+//   3. 跑 NUM_STEPS 個 time step：
+//      每步：Layer1(784→128) → Layer2(128→10)
+//   4. 統計 10 個輸出神經元的 spike 次數
+//   5. 輸出 spike 最多的神經元 = 預測的數字
+//
+// Day 4 Python 對應：
+//   for t in range(NUM_STEPS):
+//       cur1 = W1 @ input >> 5
+//       mem1 = beta*mem1>>5 + cur1; spk1 = ...
+//       cur2 = W2 @ spk1
+//       mem2 = beta*mem2>>5 + cur2; spk2 = ...
+//   predicted = argmax(sum(spk2_record))
+//
+// =============================================================
+
+module snn_top #(
+    parameter NUM_INPUTS   = 784,
+    parameter NUM_HIDDEN   = 128,
+    parameter NUM_OUTPUTS  = 10,
+    parameter NUM_STEPS    = 25,
+    parameter W_WIDTH      = 8,
+    parameter IN_WIDTH     = 8,
+    parameter MEM_WIDTH    = 16,
+    parameter ACC_WIDTH    = 24,
+    parameter FRAC_BITS    = 5,
+    parameter BETA         = 30,
+    parameter THRESHOLD    = 32,
+    parameter WEIGHT_FILE1 = "fc1_weight.hex",
+    parameter WEIGHT_FILE2 = "fc2_weight.hex"
+)(
+    input  wire        clk,
+    input  wire        rst_n,
+
+    // ─── 輸入介面：外部寫入圖片 ───
+    input  wire        input_wr_en,           // 寫入致能
+    input  wire [9:0]  input_wr_addr,         // 寫入地址 (0~783)
+    input  wire signed [IN_WIDTH-1:0] input_wr_data,  // 寫入資料
+
+    // ─── 控制 ───
+    input  wire        start,                 // 啟動推論
+
+    // ─── 輸出 ───
+    output reg  [3:0]  predicted_digit,       // 預測結果 (0~9)
+    output reg  [7:0]  max_spike_count,       // 最高 spike 數
+    output reg         done                   // 推論完成
+);
+
+    // =========================================================
+    // Input BRAM：存放 784 個像素
+    // =========================================================
+    reg signed [IN_WIDTH-1:0] input_bram [0:NUM_INPUTS-1];
+
+    // 外部寫入
+    always @(posedge clk) begin
+        if (input_wr_en)
+            input_bram[input_wr_addr] <= input_wr_data;
+    end
+
+    // Layer 1 讀取（1-cycle 延遲）
+    wire [9:0] l1_input_addr;
+    reg  signed [IN_WIDTH-1:0] l1_input_data;
+
+    always @(posedge clk) begin
+        l1_input_data <= input_bram[l1_input_addr];
+    end
+
+    // =========================================================
+    // Layer 1: 784 → 128
+    // =========================================================
+    reg  l1_start;
+    reg  layers_mem_clear;   // 清除兩層的膜電位
+    wire [NUM_HIDDEN-1:0] l1_spk_out;
+    wire l1_done;
+
+    fc_layer #(
+        .NUM_INPUTS(NUM_INPUTS),
+        .NUM_OUTPUTS(NUM_HIDDEN),
+        .W_WIDTH(W_WIDTH),
+        .IN_WIDTH(IN_WIDTH),
+        .MEM_WIDTH(MEM_WIDTH),
+        .ACC_WIDTH(ACC_WIDTH),
+        .FRAC_BITS(FRAC_BITS),
+        .BETA(BETA),
+        .THRESHOLD(THRESHOLD),
+        .WEIGHT_FILE(WEIGHT_FILE1),
+        .ADDR_WIDTH(10),
+        .MAC_FRAC_BITS(FRAC_BITS)
+    ) u_layer1 (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(l1_start),
+        .mem_clear(layers_mem_clear),
+        .input_addr(l1_input_addr),
+        .input_data(l1_input_data),
+        .spk_out(l1_spk_out),
+        .done(l1_done)
+    );
+
+    // =========================================================
+    // Spike Buffer：Layer 1 的 spike → Layer 2 的 input
+    // =========================================================
+    // Layer 1 輸出 128-bit spike vector
+    // Layer 2 需要逐一讀取（像讀 BRAM 一樣）
+    reg [NUM_HIDDEN-1:0] spk1_buffer;
+
+    // Layer 2 讀取 spike buffer（1-cycle 延遲模擬）
+    wire [9:0] l2_input_addr;
+    reg  signed [IN_WIDTH-1:0] l2_input_data;
+
+    always @(posedge clk) begin
+        // spike 是 0 或 1，直接轉成 IN_WIDTH 位寬
+        l2_input_data <= {{(IN_WIDTH-1){1'b0}}, spk1_buffer[l2_input_addr]};
+    end
+
+    // =========================================================
+    // Layer 2: 128 → 10
+    // =========================================================
+    reg  l2_start;
+    wire [NUM_OUTPUTS-1:0] l2_spk_out;
+    wire l2_done;
+
+    fc_layer #(
+        .NUM_INPUTS(NUM_HIDDEN),
+        .NUM_OUTPUTS(NUM_OUTPUTS),
+        .W_WIDTH(W_WIDTH),
+        .IN_WIDTH(IN_WIDTH),
+        .MEM_WIDTH(MEM_WIDTH),
+        .ACC_WIDTH(ACC_WIDTH),
+        .FRAC_BITS(FRAC_BITS),
+        .BETA(BETA),
+        .THRESHOLD(THRESHOLD),
+        .WEIGHT_FILE(WEIGHT_FILE2),
+        .ADDR_WIDTH(8),
+        .MAC_FRAC_BITS(0)    // spike 是整數 0/1，不需要右移
+    ) u_layer2 (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(l2_start),
+        .mem_clear(layers_mem_clear),
+        .input_addr(l2_input_addr),
+        .input_data(l2_input_data),
+        .spk_out(l2_spk_out),
+        .done(l2_done)
+    );
+
+    // =========================================================
+    // Spike Counters：統計每個輸出神經元的 spike 次數
+    // =========================================================
+    reg [7:0] spike_counts [0:NUM_OUTPUTS-1];
+
+    // =========================================================
+    // Top-level FSM
+    // =========================================================
+    localparam S_IDLE        = 4'd0;
+    localparam S_CLEAR      = 4'd1;
+    localparam S_CLEAR2     = 4'd2;    // 額外等一拍確保清零生效
+    localparam S_L1_RUN     = 4'd3;
+    localparam S_L1_DONE    = 4'd4;
+    localparam S_L2_RUN     = 4'd5;
+    localparam S_L2_DONE    = 4'd6;
+    localparam S_ARGMAX_INIT = 4'd7;
+    localparam S_ARGMAX     = 4'd8;
+    localparam S_FINISH     = 4'd9;
+
+    reg [3:0] state;
+    reg [4:0] step_count;
+
+    integer i;
+
+    // ─── Argmax 暫存器 ───
+    reg [3:0]  best_idx;
+    reg [7:0]  best_count;
+    reg [3:0]  argmax_idx;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state          <= S_IDLE;
+            step_count     <= 0;
+            l1_start       <= 0;
+            l2_start       <= 0;
+            layers_mem_clear <= 0;
+            spk1_buffer    <= 0;
+            predicted_digit <= 0;
+            max_spike_count <= 0;
+            done           <= 0;
+            argmax_idx     <= 0;
+
+            for (i = 0; i < NUM_OUTPUTS; i = i + 1)
+                spike_counts[i] <= 0;
+        end
+        else begin
+            l1_start         <= 0;
+            l2_start         <= 0;
+            layers_mem_clear <= 0;
+            done             <= 0;
+
+            case (state)
+
+                S_IDLE: begin
+                    if (start) begin
+                        step_count <= 0;
+
+                        // 清空 spike counters
+                        for (i = 0; i < NUM_OUTPUTS; i = i + 1)
+                            spike_counts[i] <= 0;
+
+                        // 清除兩層的膜電位
+                        layers_mem_clear <= 1;
+                        state            <= S_CLEAR;
+                    end
+                end
+
+                S_CLEAR: begin
+                    // 保持 mem_clear 再一拍，確保 fc_layer 完成清零
+                    layers_mem_clear <= 1;
+                    state <= S_CLEAR2;
+                end
+
+                S_CLEAR2: begin
+                    // 清零已完成，現在啟動 Layer 1
+                    l1_start <= 1;
+                    state    <= S_L1_RUN;
+                end
+
+                S_L1_RUN: begin
+                    // 等 Layer 1 完成
+                    if (l1_done) begin
+                        state <= S_L1_DONE;
+                    end
+                end
+
+                S_L1_DONE: begin
+                    // 暫存 Layer 1 的 spike 到 buffer
+                    spk1_buffer <= l1_spk_out;
+
+                    // 啟動 Layer 2
+                    l2_start <= 1;
+                    state    <= S_L2_RUN;
+                end
+
+                S_L2_RUN: begin
+                    // 等 Layer 2 完成
+                    if (l2_done) begin
+                        state <= S_L2_DONE;
+                    end
+                end
+
+                S_L2_DONE: begin
+                    // 累加 spike counts
+                    for (i = 0; i < NUM_OUTPUTS; i = i + 1) begin
+                        if (l2_spk_out[i])
+                            spike_counts[i] <= spike_counts[i] + 1;
+                    end
+
+                    // 下一個 time step 或結束
+                    if (step_count == NUM_STEPS - 1) begin
+                        // ★ 不在這裡讀 spike_counts！
+                        // 因為上面的 <= 還沒生效，要等一拍
+                        state <= S_ARGMAX_INIT;
+                    end
+                    else begin
+                        step_count <= step_count + 1;
+                        l1_start   <= 1;
+                        state      <= S_L1_RUN;
+                    end
+                end
+
+                S_ARGMAX_INIT: begin
+                    // ★ 現在 spike_counts 已經包含最後一步的值了 ★
+                    best_idx   <= 0;
+                    best_count <= spike_counts[0];
+                    argmax_idx <= 1;
+                    state      <= S_ARGMAX;
+                end
+
+                S_ARGMAX: begin
+                    // 每拍只比較一個 neuron（打破長組合邏輯鏈）
+                    if (spike_counts[argmax_idx] > best_count) begin
+                        best_count <= spike_counts[argmax_idx];
+                        best_idx   <= argmax_idx;
+                    end
+
+                    if (argmax_idx == NUM_OUTPUTS - 1) begin
+                        state <= S_FINISH;
+                    end
+                    else begin
+                        argmax_idx <= argmax_idx + 1;
+                    end
+                end
+
+                S_FINISH: begin
+                    predicted_digit <= best_idx;
+                    max_spike_count <= best_count;
+                    done            <= 1;
+                    state           <= S_IDLE;
+                end
+
+            endcase
+        end
+    end
+
+endmodule
